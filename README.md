@@ -1,58 +1,112 @@
-# LLM-LNS
+# LLM-SAS
 
-An LLM-guided Large Neighborhood Search framework for combinatorial optimization and MILP problems. The system combines LLM-based heuristic generation, prompt evolution, typed neighborhood operators, structured decision making, and a lightweight reliability layer.
+LLM-SAS stands for **LLM-guided Structure-Aware Search**. It is a structure-aware Large Neighborhood Search framework for MILP and combinatorial optimization, with a particular focus on letting an LLM make high-level neighborhood decisions from solver state and MILP structure instead of directly emitting raw variable IDs.
 
-## Overview
+## What This Repository Does
 
-This repository implements an evolutionary heuristic-design framework with two interacting loops:
+This repository keeps the original evolutionary heuristic-design flavor of the project, but the MILP pipeline is now centered on a new structure-aware search layer:
 
-- a prompt evolution loop that improves how the LLM is asked to design heuristics
-- an algorithm evolution loop that improves the generated heuristics themselves
+- extract MILP structure and runtime signals
+- ask the LLM for a structured neighborhood decision
+- map that decision to a typed operator
+- repair unsafe decisions with a reliability checker
+- solve the resulting LNS subproblem with Gurobi
+- update operator history and decision traces
 
-For the MILP problems, the framework now goes beyond plain variable scoring. Instead of asking the LLM to directly pick raw variable indices, the system exposes a richer neighborhood-design interface with:
+In short, `LLM-SAS` turns LLM-guided neighborhood search from a free-form prompting setup into a controlled, analyzable, structure-aware decision pipeline.
 
-- MILP structural features
-- typed neighborhood operators
-- structured JSON operator decisions
-- a reliability checker with a simple bandit adjustment layer
+## Main Idea
+
+The central idea is simple:
+
+1. do not ask the LLM to output arbitrary variable indices directly
+2. provide the LLM with structural summaries of the MILP instance and the current solver state
+3. let it choose a typed neighborhood strategy in structured JSON
+4. use a lightweight adaptive layer to make the final decision executable and reliable
+
+This is why the method is called **Structure-Aware Search**.
 
 ## Main Innovations
 
-### 1. MILP structural feature augmentation
+### 1. Structure-aware MILP features
 
-Each LNS round is informed by multi-level features:
+Each LNS round is described by multi-level features rather than only coefficients and incumbent values.
 
-- **global MILP features**: `num_vars`, `num_constraints`, `binary_ratio`, `integer_ratio`, `density`, `avg_var_degree`, `avg_constr_degree`, objective statistics, RHS statistics, LP gap, incumbent objective, best bound, elapsed time, and no-improvement rounds
-- **variable features**: `obj_abs`, `degree`, `lp_value`, `incumbent_value`, `fractionality`, `reduced_cost`, `tight_constr_count`, `historical_flip_freq`, and `historical_improve_score`
-- **constraint features**: `slack`, `tightness`, `degree`, `violation`, `dual_value`, and `constraint_type_hint`
+Global features include:
 
-This turns neighborhood selection from a raw heuristic guess into a state-aware, structure-aware decision problem.
+- `num_vars`
+- `num_constraints`
+- `binary_ratio`
+- `integer_ratio`
+- `density`
+- `avg_var_degree`
+- `avg_constr_degree`
+- `obj_coef_mean/std/max`
+- `rhs_mean/std`
+- `lp_gap`
+- `incumbent_obj`
+- `best_bound`
+- `time_elapsed`
+- `no_improve_rounds`
+
+Variable features include:
+
+- `obj_abs`
+- `degree`
+- `lp_value`
+- `incumbent_value`
+- `fractionality`
+- `reduced_cost`
+- `tight_constr_count`
+- `historical_flip_freq`
+- `historical_improve_score`
+
+Constraint features include:
+
+- `slack`
+- `tightness`
+- `degree`
+- `violation`
+- `dual_value`
+- `constraint_type_hint`
+
+These features let the LLM reason about bottlenecks, stagnation, objective concentration, tight regions, and exploration state.
 
 ### 2. Typed Neighborhood Operator Library
 
-The MILP pipeline includes a typed operator library so the LLM can choose high-level neighborhood styles instead of directly manipulating variable IDs:
+Instead of raw variable-index output, the LLM chooses from a typed operator library:
 
-- `FRAC-LNS`: focuses on highly fractional variables
-- `TIGHT-LNS`: focuses on variables around tight constraints
-- `OBJ-LNS`: focuses on high-impact objective variables
-- `GRAPH-BLOCK-LNS`: releases graph-local blocks from the variable-constraint bipartite graph
-- `HISTORY-LNS`: exploits historically useful variables
-- `DIVERSITY-LNS`: explores rarely released variables
-- `HYBRID-LNS`: combines several operators with weights
+- `FRAC-LNS`
+- `TIGHT-LNS`
+- `OBJ-LNS`
+- `GRAPH-BLOCK-LNS`
+- `HISTORY-LNS`
+- `DIVERSITY-LNS`
+- `HYBRID-LNS`
 
-The runtime converts operator decisions into executable variable scores.
+Their intended roles are:
 
-### 3. Structured LLM decision interface
+- `FRAC-LNS`: release highly fractional variables when LP gap is informative
+- `TIGHT-LNS`: release variables around tight constraints when local bottlenecks dominate
+- `OBJ-LNS`: focus on high-impact objective variables
+- `GRAPH-BLOCK-LNS`: release graph-local blocks for sparse large instances
+- `HISTORY-LNS`: exploit historically effective variables
+- `DIVERSITY-LNS`: force exploration when the search stalls
+- `HYBRID-LNS`: combine several operators with weights
 
-The LLM is prompted with a round-level structured context instead of free-form text only. Each round includes:
+This gives the framework a clean action space that is both interpretable and easy to analyze.
 
-- `problem_summary`
-- `solver_state`
-- `structural_signals`
-- `previous_operator_performance`
-- `decision_requirement`
+### 3. Structured JSON decision protocol
 
-The preferred output is JSON, for example:
+Each round, the LLM receives five blocks of context:
+
+- `Problem Summary`
+- `Solver State`
+- `Structural Signals`
+- `Previous Operator Performance`
+- `Decision Requirement`
+
+The preferred output is JSON only, for example:
 
 ```json
 {
@@ -65,48 +119,141 @@ The preferred output is JSON, for example:
 }
 ```
 
-This makes the decision process more interpretable, more controllable, and easier to analyze.
+This makes the LLM decision machine-readable, easier to constrain, and easier to log for later analysis.
 
-### 4. Reliability checker and bandit adjustment
+### 4. Reliability checker and adaptive bandit control
 
-The LLM decision is not executed blindly. Before solving each LNS subproblem, the system applies:
+LLM output is not executed blindly.
 
-- a **simple bandit controller** that scores operators by improvement-per-second, exploration bonus, and failure rate
-- a **reliability checker** that repairs unsafe or ineffective decisions
+Before each neighborhood is solved, the framework applies:
 
-The checker currently handles:
+- a **bandit layer** that adjusts operators according to historical reward
+- a **reliability checker** that repairs invalid or low-quality neighborhood decisions
+
+The checker handles issues such as:
 
 - too few free variables
 - too many free variables
 - excessive overlap with the previous neighborhood
-- overly scattered neighborhoods in sparse graph structure
+- overly scattered variables when graph locality is poor
 - repeated operator failure
 - frequent timeout pressure
 
-The final execution flow is:
+The bandit score follows a simple but useful form:
+
+```text
+score_k = avg_improvement_per_second_k
+        + beta * exploration_bonus_k
+        - gamma * failure_rate_k
+```
+
+This gives the method a lightweight exploit/explore correction layer on top of LLM decisions.
+
+## Core MILP Logic
+
+The MILP pipeline has been refactored into a shared-core design.
+
+### Shared core
+
+The main implementation lives in:
+
+- `src/MILP Problems/milp_problem_eoh_common.py`
+
+This file is responsible for:
+
+- path resolution and problem configuration
+- LLM backend configuration
+- feature extraction
+- prompt construction
+- typed operator execution
+- reliability checking
+- bandit update
+- Gurobi-based LNS solving
+- decision trace logging
+
+### Thin problem wrappers
+
+The four MILP problem files:
+
+- `IS_eoh_change_prompt_ACP.py`
+- `MIKS_eoh_change_prompt_ACP.py`
+- `MVC_eoh_change_prompt_ACP.py`
+- `SC_eoh_change_prompt_ACP.py`
+
+are now thin wrappers that only define:
+
+- problem metadata
+- dataset path
+- output path
+
+and then call the shared `main()` entry in `milp_problem_eoh_common.py`.
+
+This keeps the business logic in one place and makes future extensions much easier.
+
+## End-to-End Workflow
+
+The runtime workflow is:
+
+```text
+Problem wrapper
+  -> configure paths and problem metadata
+  -> build default runtime parameters
+  -> load LP instances
+  -> solve root / collect incumbent and LP state
+  -> extract MILP structural features
+  -> build round-level LLM context
+  -> query LLM for JSON operator decision
+  -> bandit adjustment
+  -> reliability checker
+  -> convert typed operator to released-variable scores
+  -> solve LNS subproblem with Gurobi
+  -> update rewards, history, and traces
+  -> continue to next round
+```
+
+Inside one LNS round, the decision chain is:
 
 ```text
 LLM decision
-  -> bandit adjustment
-  -> reliability checker
+  -> bandit decision
+  -> checked decision
   -> neighborhood construction
-  -> MILP subproblem solve
-  -> operator reward update
+  -> solver outcome
+  -> reward update
 ```
 
-## Supported Problems
+## Decision Trace and Analysis
 
-### MILP problems
+Each MILP run can write round-level JSONL traces under:
 
-- **IS**: Independent Set
-- **MIKS**: Maximum Independent K-Set
-- **MVC**: Minimum Vertex Cover
-- **SC**: Set Cover
+- `results/traces/`
 
-### Other optimization problems
+Each record captures:
 
-- **Online Bin Packing**
-- **Traveling Salesman Problem**
+- `llm_decision`
+- `bandit_decision`
+- `checked_decision`
+- selected operator
+- released variable ratio
+- solver runtime and status
+- objective improvement
+- structural signals
+- reward-related information
+
+This makes the framework not only runnable, but also inspectable.
+
+Trace summaries can be generated with:
+
+```bash
+python scripts/summarize_decision_traces.py --trace-dir results/traces
+```
+
+This produces:
+
+- `decision_trace_rounds.csv`
+- `decision_trace_operator_summary.csv`
+- `decision_trace_checker_summary.csv`
+- `operator_report.md`
 
 ## Repository Structure
 
@@ -119,150 +266,28 @@ LLM-SAS/
 │  │  ├─ MIKS_eoh_change_prompt_ACP.py
 │  │  ├─ MVC_eoh_change_prompt_ACP.py
 │  │  └─ SC_eoh_change_prompt_ACP.py
-│  └─ ...
+├─ scripts/
+│  ├─ smoke_check_milp.py
+│  └─ summarize_decision_traces.py
 ├─ results/
 └─ README.md
 ```
 
-The MILP scripts now share a common implementation:
+## Supported Problems
 
-- `milp_problem_eoh_common.py` contains the unified MILP EOH pipeline
-- each problem-specific script is a thin wrapper with its own `PROBLEM_CONFIG`
+### MILP problems
 
-## Core Logic
+- `IS`: Independent Set
+- `MIKS`: Maximum Independent K-Set
+- `MVC`: Minimum Vertex Cover
+- `SC`: Set Cover
 
-The MILP part of the repository now follows a shared-core architecture.
+### Other problems already present in the repository
 
-### Problem wrappers
+- Online Bin Packing
+- Traveling Salesman Problem
 
-Each of the four MILP entry files only defines:
-
-- `problem_code`
-- `problem_label`
-- `problem_prompt_description`
-- `instance_path`
-- `exp_output_path`
-
-and then forwards control to:
-
-```python
-from milp_problem_eoh_common import main
-```
-
-This keeps problem-specific differences lightweight and moves the full search logic into one reusable implementation.
-
-### Shared MILP core
-
-The file `src/MILP Problems/milp_problem_eoh_common.py` is the runtime center of the MILP pipeline. It is responsible for:
-
-- loading and resolving instance paths
-- building prompt-evolution and algorithm-evolution settings
-- extracting MILP structural features
-- collecting solver-state and neighborhood-history signals
-- querying the LLM through a remote or local OpenAI-compatible endpoint
-- translating operator decisions into executable neighborhoods
-- running bandit adjustment and reliability checking
-- solving subproblems with Gurobi
-- recording decision traces and operator rewards
-
-### Why this refactor matters
-
-Compared with the original per-problem duplicated implementation, this shared-core design provides:
-
-- a single place to add new neighborhood operators
-- a single place to evolve the LLM prompt interface
-- consistent decision logging across IS, MIKS, MVC, and SC
-- lower maintenance cost for future ablations and experiments
-
-## End-to-End Workflow
-
-The overall execution workflow for MILP experiments is:
-
-```text
-Problem wrapper
-  -> configure problem paths and labels
-  -> build default runtime parameters
-  -> create EOH/LLM evolution engine
-  -> load MILP instances
-  -> extract structural features
-  -> build round-level decision context
-  -> query LLM for structured operator JSON
-  -> bandit adjustment
-  -> reliability checker
-  -> construct neighborhood
-  -> Gurobi subproblem solve
-  -> reward / history / trace update
-  -> continue to next round
-```
-
-Inside one LNS round, the logic is:
-
-1. read the incumbent solution, LP relaxation state, and constraint activity
-2. compute global, variable-level, and constraint-level structural features
-3. summarize search-state signals such as stagnation, fractionality concentration, and exploration ratio
-4. package the information into a structured prompt
-5. ask the LLM to output an operator decision in JSON form
-6. let the bandit layer decide whether the proposed operator should be kept or adjusted
-7. let the checker repair unsafe choices such as oversized neighborhoods or excessive overlap
-8. translate the final typed operator into released-variable scores
-9. solve the resulting subproblem with Gurobi under the assigned time budget
-10. update reward statistics, operator history, and decision traces
-
-## Innovation Summary
-
-The main research-side contributions of this refactor are the following four modules.
-
-### 1. Structure-aware MILP representation
-
-The framework no longer relies only on raw coefficients or direct variable IDs. Instead, it exposes:
-
-- global MILP statistics
-- variable-level structural signals
-- constraint-level activity signals
-- round-level runtime state
-
-This gives the LLM a better picture of both the optimization landscape and the current search stage.
-
-### 2. Typed operator selection instead of raw variable output
-
-The LLM is encouraged to choose from a library of neighborhood operators rather than emitting unstructured variable sets. This makes decisions:
-
-- more interpretable
-- easier to constrain
-- easier to compare in ablation studies
-- easier to extend with learned or handcrafted operators later
-
-### 3. Structured JSON decision protocol
-
-The LLM now answers with a machine-readable decision object containing:
-
-- operator type
-- free ratio
-- time budget
-- search focus
-- exploration level
-- explanation
-
-This decouples the semantic decision from the solver implementation and makes downstream control much more robust.
-
-### 4. Reliability and adaptive control
-
-A lightweight control layer now sits between the LLM and the solver:
-
-- the **bandit** layer adjusts decisions using empirical operator performance
-- the **checker** layer enforces legal and practical neighborhoods
-
-This prevents brittle behavior such as always selecting the same operator, opening too many variables, or repeatedly timing out.
-
-## Datasets
-
-For MILP problems, datasets are available [here](https://github.com/thuiar/MILPBench/tree/main/Benchmark%20Datasets).
-
-For online bin packing, the data generation is included in the code.
-
-For TSP problems, datasets are available [here](https://github.com/mastqe/tsplib).
-
-## Requirements
+## Environment and Running
 
 Install dependencies:
 
@@ -277,13 +302,7 @@ Key dependencies include:
 - `joblib`
 - `requests`
 
-## Quick Start
-
-### 1. Configure environment
-
-The MILP pipeline now reads its runtime configuration from environment variables. This works both for remote APIs and for local OpenAI-compatible endpoints such as vLLM, SGLang, and LM Studio.
-
-Example:
+The MILP pipeline reads runtime configuration from environment variables:
 
 ```bash
 export LLM_SAS_MILP_DATA_ROOT=/path/to/datasets
@@ -293,16 +312,20 @@ export LLM_SAS_LLM_MODEL=your_local_model_name
 export LLM_SAS_LLM_BACKEND=local_openai_compatible
 ```
 
-If you use a remote provider, set `LLM_SAS_LLM_ENDPOINT`, `LLM_SAS_LLM_API_KEY`, and `LLM_SAS_LLM_MODEL` accordingly. If you do not set `LLM_SAS_MILP_DATA_ROOT`, the code will look for datasets under the `LLM-SAS/` project root.
+This supports remote APIs as well as local OpenAI-compatible endpoints such as:
 
-Before running experiments, you can do a quick environment check:
+- vLLM
+- SGLang
+- LM Studio
+
+Before running experiments, you can check the environment with:
 
 ```bash
 python scripts/smoke_check_milp.py
 python scripts/smoke_check_milp.py --check-endpoint
 ```
 
-### 2. Run a MILP problem
+Run a MILP problem with:
 
 ```bash
 python src/MILP\ Problems/MIKS_eoh_change_prompt_ACP.py
@@ -311,94 +334,24 @@ python src/MILP\ Problems/MVC_eoh_change_prompt_ACP.py
 python src/MILP\ Problems/SC_eoh_change_prompt_ACP.py
 ```
 
-### 3. What happens during execution
+## Why LLM-SAS Is Different
 
-For MILP problems, each run will:
+Compared with a standard LLM-guided LNS setup, `LLM-SAS` makes three changes in spirit:
 
-1. load LP instances
-2. build MILP structural features
-3. initialize typed-operator seed heuristics
-4. generate and evolve LLM heuristics
-5. make structured operator decisions round by round
-6. run bandit adjustment and reliability checking
-7. solve the resulting LNS subproblems with Gurobi
+- it gives the LLM structured access to MILP geometry and runtime state
+- it constrains LLM behavior to a typed, analyzable operator space
+- it inserts an adaptive control layer between language decisions and solver execution
 
-## MILP Decision Pipeline
+So the method is not just "LLM picks a neighborhood." It is:
 
-The current MILP neighborhood selection pipeline is:
+**LLM + structure signals + typed action space + reliability control + solver feedback**
 
-```text
-MILP instance
-  -> static features
-  -> runtime state features
-  -> structured decision context
-  -> LLM JSON operator decision
-  -> typed operator score construction
-  -> bandit adjustment
-  -> reliability checking
-  -> neighborhood mask
-  -> Gurobi subproblem
-  -> reward/history update
-```
+## Datasets
 
-## Decision Trace and Analysis
+For MILP problems, benchmark datasets are available from [MILPBench](https://github.com/thuiar/MILPBench/tree/main/Benchmark%20Datasets).
 
-Each MILP run can write round-level decision traces under `results/traces/`. A trace record stores the full decision chain:
-
-- `llm_decision`
-- `bandit_decision`
-- `checked_decision`
-- released variable statistics
-- solver runtime and status
-- objective change and reward
-
-This makes the framework suitable not only for optimization experiments, but also for operator-behavior analysis and prompt-debugging analysis.
-
-The summarizer script:
-
-```bash
-python scripts/summarize_decision_traces.py --trace-dir results/traces
-```
-
-aggregates these raw traces into:
-
-- round-level CSV records
-- operator-level summaries
-- checker-trigger summaries
-- a Markdown operator report
-
-## Results
-
-Experimental results and comparisons can be recorded under [`results/`](results/).
-
-Decision traces can be summarized with:
-
-```bash
-python scripts/summarize_decision_traces.py --trace-dir results/traces
-```
-
-This produces:
-
-- `results/traces/decision_trace_rounds.csv`
-- `results/traces/decision_trace_operator_summary.csv`
-- `results/traces/decision_trace_checker_summary.csv`
-- `results/traces/operator_report.md`
-
-## Notes
-
-- The MILP implementation now prefers structured operator decisions over raw variable-index decisions.
-- Raw score output is still supported for backward compatibility.
-- The shared MILP core makes it easier to add new problem types or new operator families later.
+For TSP problems, datasets are available from [TSPLIB-related resources](https://github.com/mastqe/tsplib).
 
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
-
-## Contributing
-
-Issues and pull requests are welcome, especially for:
-
-- new typed neighborhood operators
-- improved decision-context design
-- stronger bandit or checker policies
-- new MILP benchmark integrations
